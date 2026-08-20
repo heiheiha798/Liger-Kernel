@@ -139,9 +139,7 @@ class LigerMultiTokenAttentionFunction(torch.autograd.Function):
             activation_output = probs_softmax
             ctx.save_for_backward(scores_inf, activation_output, weight, bias)
             ctx.out_flat_sparse_saved = False
-            ctx.BLOCK_SIZE = BLOCK_SIZE
-            ctx.num_warps = num_warps
-            ctx.multi_block_launch = multi_block_launch
+            ctx.softmax_backward_args = (BLOCK_SIZE, num_warps, multi_block_launch)
 
         out_conv = F.conv2d(
             activation_output,
@@ -204,9 +202,7 @@ class LigerMultiTokenAttentionFunction(torch.autograd.Function):
             grad_scores_inf = _softmax_backward(
                 grad_probs,
                 activation_output,
-                ctx.BLOCK_SIZE,
-                ctx.num_warps,
-                ctx.multi_block_launch,
+                *ctx.softmax_backward_args,
             )
 
         grad_scores = _mask_inf_backward(grad_scores_inf)
