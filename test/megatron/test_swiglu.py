@@ -344,7 +344,7 @@ def test_fused_gate_up_tiled_matches_one_row_and_reference(monkeypatch, shape, i
     def run(use_tiled):
         monkeypatch.setattr(swiglu_ops, "_should_use_fused_sm103_tiling", lambda _ffn, _device: use_tiled)
         kernel_input = source.clone().requires_grad_(True)
-        output = LigerFusedGateUpSiLUMulFunction.apply(kernel_input, in_place)
+        output = LigerMegatronSwiGLU(in_place=in_place)(kernel_input)
         output.backward(dc)
         input_after = kernel_input.detach().clone()
         gradient = kernel_input.grad.detach().clone()
