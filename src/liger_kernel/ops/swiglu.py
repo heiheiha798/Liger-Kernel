@@ -305,21 +305,25 @@ class LigerSiLUMulFunction(torch.autograd.Function):
 
 # On SM103, the one-row backward kernel becomes register-limited once its
 # next-power-of-two block reaches 16384 columns. Fixed column tiles reduce the
-# live vector width while preserving the elementwise arithmetic. The 32768
-# width stays on the one-row path because it regressed in the B300 sweep.
+# live vector width while preserving the elementwise arithmetic. FP32 and the
+# 11008/32768 widths stay on the one-row path because they regressed in the
+# B300 sweep.
 _FUSED_SWIGLU_SM103_TILE_SIZE = 1024
 _FUSED_SWIGLU_SM103_TILE_MIN_BLOCK = 16384
 _FUSED_SWIGLU_SM103_TILE_MAX_WIDTH = 32768
+_FUSED_SWIGLU_SM103_LEGACY_WIDTHS = (11008,)
 
 
-def _should_use_fused_sm103_tiling(ffn_size, device):
+def _should_use_fused_sm103_tiling(ffn_size, device, dtype):
     if device.type != "cuda":
         return False
     device_id = device.index if device.index is not None else torch.cuda.current_device()
     return (
         infer_device_arch(device_id) == "blackwell_ultra"
+        and dtype in (torch.bfloat16, torch.float16)
         and triton.next_power_of_2(ffn_size) >= _FUSED_SWIGLU_SM103_TILE_MIN_BLOCK
         and ffn_size < _FUSED_SWIGLU_SM103_TILE_MAX_WIDTH
+        and ffn_size not in _FUSED_SWIGLU_SM103_LEGACY_WIDTHS
     )
 
 
@@ -427,7 +431,7 @@ def swiglu_fused_gate_up_forward(y):
     n_rows = y.shape[0]
     c = torch.empty(n_rows, ffn_size, dtype=y.dtype, device=y.device)
 
-    if _should_use_fused_sm103_tiling(ffn_size, y.device):
+    if _should_use_fused_sm103_tiling(ffn_size, y.device, y.dtype):
         block_size = _FUSED_SWIGLU_SM103_TILE_SIZE
         grid = (n_rows, triton.cdiv(ffn_size, block_size))
         _swiglu_fused_gate_up_forward_kernel_tiled[grid](
@@ -471,7 +475,7 @@ def swiglu_fused_gate_up_backward(y, dc, in_place=False):
     n_rows = dc.shape[0]
     dy = y if in_place else torch.empty_like(y)
 
-    if _should_use_fused_sm103_tiling(ffn_size, y.device):
+    if _should_use_fused_sm103_tiling(ffn_size, y.device, y.dtype):
         block_size = _FUSED_SWIGLU_SM103_TILE_SIZE
         grid = (n_rows, triton.cdiv(ffn_size, block_size))
         _swiglu_fused_gate_up_backward_kernel_tiled[grid](

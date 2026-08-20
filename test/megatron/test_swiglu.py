@@ -276,17 +276,20 @@ def test_default_path_supports_repeated_backward():
 
 
 @pytest.mark.parametrize(
-    "arch, ffn_size, expected",
+    "arch, ffn_size, dtype, expected",
     [
-        ("blackwell_ultra", 8192, False),
-        ("blackwell_ultra", 8193, True),
-        ("blackwell_ultra", 32767, True),
-        ("blackwell_ultra", 32768, False),
-        ("blackwell", 14336, False),
-        ("hopper", 14336, False),
+        ("blackwell_ultra", 8192, torch.bfloat16, False),
+        ("blackwell_ultra", 8193, torch.bfloat16, True),
+        ("blackwell_ultra", 11008, torch.float16, False),
+        ("blackwell_ultra", 14336, torch.float16, True),
+        ("blackwell_ultra", 14336, torch.float32, False),
+        ("blackwell_ultra", 32767, torch.bfloat16, True),
+        ("blackwell_ultra", 32768, torch.bfloat16, False),
+        ("blackwell", 14336, torch.bfloat16, False),
+        ("hopper", 14336, torch.bfloat16, False),
     ],
 )
-def test_fused_gate_up_sm103_tiled_dispatch(monkeypatch, arch, ffn_size, expected):
+def test_fused_gate_up_sm103_tiled_dispatch(monkeypatch, arch, ffn_size, dtype, expected):
     requested_device_ids = []
 
     def infer_arch(device_id):
@@ -294,7 +297,7 @@ def test_fused_gate_up_sm103_tiled_dispatch(monkeypatch, arch, ffn_size, expecte
         return arch
 
     monkeypatch.setattr(swiglu_ops, "infer_device_arch", infer_arch)
-    assert swiglu_ops._should_use_fused_sm103_tiling(ffn_size, torch.device("cuda:7")) is expected
+    assert swiglu_ops._should_use_fused_sm103_tiling(ffn_size, torch.device("cuda:7"), dtype) is expected
     assert requested_device_ids == [7]
 
 
@@ -304,7 +307,7 @@ def test_fused_gate_up_tiling_rejects_non_cuda_without_arch_query(monkeypatch):
         "infer_device_arch",
         lambda _device_id: pytest.fail("architecture queried for a non-CUDA tensor"),
     )
-    assert not swiglu_ops._should_use_fused_sm103_tiling(14336, torch.device("cpu"))
+    assert not swiglu_ops._should_use_fused_sm103_tiling(14336, torch.device("cpu"), torch.bfloat16)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="SM103 tiled fused SwiGLU path is CUDA-only")
@@ -342,7 +345,11 @@ def test_fused_gate_up_tiled_matches_one_row_and_reference(monkeypatch, shape, i
     reference_output.backward(dc)
 
     def run(use_tiled):
-        monkeypatch.setattr(swiglu_ops, "_should_use_fused_sm103_tiling", lambda _ffn, _device: use_tiled)
+        monkeypatch.setattr(
+            swiglu_ops,
+            "_should_use_fused_sm103_tiling",
+            lambda _ffn, _device, _dtype: use_tiled,
+        )
         kernel_input = source.clone().requires_grad_(True)
         output = LigerMegatronSwiGLU(in_place=in_place)(kernel_input)
         output.backward(dc)
