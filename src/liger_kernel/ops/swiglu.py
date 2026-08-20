@@ -434,15 +434,16 @@ def swiglu_fused_gate_up_forward(y):
     if _should_use_fused_sm103_tiling(ffn_size, y.device, y.dtype):
         block_size = _FUSED_SWIGLU_SM103_TILE_SIZE
         grid = (n_rows, triton.cdiv(ffn_size, block_size))
-        _swiglu_fused_gate_up_forward_kernel_tiled[grid](
-            y,
-            c,
-            y.stride(-2),
-            c.stride(-2),
-            ffn_size=ffn_size,
-            BLOCK_SIZE=block_size,
-            num_warps=4,
-        )
+        with device_context(y.device):
+            _swiglu_fused_gate_up_forward_kernel_tiled[grid](
+                y,
+                c,
+                y.stride(-2),
+                c.stride(-2),
+                ffn_size=ffn_size,
+                BLOCK_SIZE=block_size,
+                num_warps=4,
+            )
         return y, c.view(*ori_shape[:-1], ffn_size)
 
     BLOCK_SIZE, num_warps = calculate_settings(ffn_size)
@@ -478,16 +479,17 @@ def swiglu_fused_gate_up_backward(y, dc, in_place=False):
     if _should_use_fused_sm103_tiling(ffn_size, y.device, y.dtype):
         block_size = _FUSED_SWIGLU_SM103_TILE_SIZE
         grid = (n_rows, triton.cdiv(ffn_size, block_size))
-        _swiglu_fused_gate_up_backward_kernel_tiled[grid](
-            dc,
-            y,
-            dy,
-            y.stride(-2),
-            dc.stride(-2),
-            ffn_size=ffn_size,
-            BLOCK_SIZE=block_size,
-            num_warps=4,
-        )
+        with device_context(y.device):
+            _swiglu_fused_gate_up_backward_kernel_tiled[grid](
+                dc,
+                y,
+                dy,
+                y.stride(-2),
+                dc.stride(-2),
+                ffn_size=ffn_size,
+                BLOCK_SIZE=block_size,
+                num_warps=4,
+            )
         return dy
 
     BLOCK_SIZE, num_warps = calculate_settings(ffn_size)

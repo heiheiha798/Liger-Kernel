@@ -311,6 +311,29 @@ def test_fused_gate_up_tiling_rejects_non_cuda_without_arch_query(monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="SM103 tiled fused SwiGLU path is CUDA-only")
+def test_fused_gate_up_tiled_launch_uses_input_device_context(monkeypatch):
+    entered_devices = []
+    original_device_context = swiglu_ops.device_context
+
+    def recording_device_context(input_device):
+        entered_devices.append(input_device)
+        return original_device_context(input_device)
+
+    monkeypatch.setattr(
+        swiglu_ops,
+        "_should_use_fused_sm103_tiling",
+        lambda _ffn, _device, _dtype: True,
+    )
+    monkeypatch.setattr(swiglu_ops, "device_context", recording_device_context)
+
+    kernel_input = torch.randn((3, 2 * 8193), device=device, dtype=torch.float16, requires_grad=True)
+    output = LigerMegatronSwiGLU()(kernel_input)
+    output.backward(torch.randn_like(output))
+
+    assert entered_devices == [kernel_input.device, kernel_input.device]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="SM103 tiled fused SwiGLU path is CUDA-only")
 @pytest.mark.parametrize(
     "shape",
     [
