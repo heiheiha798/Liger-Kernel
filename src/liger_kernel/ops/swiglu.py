@@ -315,16 +315,16 @@ _FUSED_SWIGLU_SM103_LEGACY_WIDTHS = (11008,)
 
 
 def _should_use_fused_sm103_tiling(ffn_size, device, dtype):
-    if device.type != "cuda":
+    if (
+        device.type != "cuda"
+        or dtype not in (torch.bfloat16, torch.float16)
+        or triton.next_power_of_2(ffn_size) < _FUSED_SWIGLU_SM103_TILE_MIN_BLOCK
+        or ffn_size >= _FUSED_SWIGLU_SM103_TILE_MAX_WIDTH
+        or ffn_size in _FUSED_SWIGLU_SM103_LEGACY_WIDTHS
+    ):
         return False
     device_id = device.index if device.index is not None else torch.cuda.current_device()
-    return (
-        infer_device_arch(device_id) == "blackwell_ultra"
-        and dtype in (torch.bfloat16, torch.float16)
-        and triton.next_power_of_2(ffn_size) >= _FUSED_SWIGLU_SM103_TILE_MIN_BLOCK
-        and ffn_size < _FUSED_SWIGLU_SM103_TILE_MAX_WIDTH
-        and ffn_size not in _FUSED_SWIGLU_SM103_LEGACY_WIDTHS
-    )
+    return infer_device_arch(device_id) == "blackwell_ultra"
 
 
 @triton.jit

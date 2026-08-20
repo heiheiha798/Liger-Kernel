@@ -276,20 +276,20 @@ def test_default_path_supports_repeated_backward():
 
 
 @pytest.mark.parametrize(
-    "arch, ffn_size, dtype, expected",
+    "arch, ffn_size, dtype, expected, queries_arch",
     [
-        ("blackwell_ultra", 8192, torch.bfloat16, False),
-        ("blackwell_ultra", 8193, torch.bfloat16, True),
-        ("blackwell_ultra", 11008, torch.float16, False),
-        ("blackwell_ultra", 14336, torch.float16, True),
-        ("blackwell_ultra", 14336, torch.float32, False),
-        ("blackwell_ultra", 32767, torch.bfloat16, True),
-        ("blackwell_ultra", 32768, torch.bfloat16, False),
-        ("blackwell", 14336, torch.bfloat16, False),
-        ("hopper", 14336, torch.bfloat16, False),
+        ("blackwell_ultra", 8192, torch.bfloat16, False, False),
+        ("blackwell_ultra", 8193, torch.bfloat16, True, True),
+        ("blackwell_ultra", 11008, torch.float16, False, False),
+        ("blackwell_ultra", 14336, torch.float16, True, True),
+        ("blackwell_ultra", 14336, torch.float32, False, False),
+        ("blackwell_ultra", 32767, torch.bfloat16, True, True),
+        ("blackwell_ultra", 32768, torch.bfloat16, False, False),
+        ("blackwell", 14336, torch.bfloat16, False, True),
+        ("hopper", 14336, torch.bfloat16, False, True),
     ],
 )
-def test_fused_gate_up_sm103_tiled_dispatch(monkeypatch, arch, ffn_size, dtype, expected):
+def test_fused_gate_up_sm103_tiled_dispatch(monkeypatch, arch, ffn_size, dtype, expected, queries_arch):
     requested_device_ids = []
 
     def infer_arch(device_id):
@@ -298,7 +298,7 @@ def test_fused_gate_up_sm103_tiled_dispatch(monkeypatch, arch, ffn_size, dtype, 
 
     monkeypatch.setattr(swiglu_ops, "infer_device_arch", infer_arch)
     assert swiglu_ops._should_use_fused_sm103_tiling(ffn_size, torch.device("cuda:7"), dtype) is expected
-    assert requested_device_ids == [7]
+    assert requested_device_ids == ([7] if queries_arch else [])
 
 
 def test_fused_gate_up_tiling_rejects_non_cuda_without_arch_query(monkeypatch):
