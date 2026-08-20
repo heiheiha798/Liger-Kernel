@@ -6,6 +6,8 @@ from test.utils import assert_verbose_allclose
 from test.utils import set_seed
 from test.utils import supports_bfloat16
 
+import liger_kernel.ops.multi_token_attention as multi_token_attention_ops
+
 from liger_kernel.transformers.functional import liger_multi_token_attention
 from liger_kernel.transformers.multi_token_attention import LigerMultiTokenAttention
 from liger_kernel.utils import infer_device
@@ -45,6 +47,8 @@ class TorchMultiTokenAttention(torch.nn.Module):
         (2, 4, 4, 8, 3, 1),
         (1, 2, 2, 5, 1, 1),
         (3, 6, 6, 6, 3, 1),
+        (1, 4, 4, 33, 5, 4),
+        (1, 8, 8, 128, 5, 2),
     ],
 )
 @pytest.mark.parametrize("bias", [True, False])
@@ -52,6 +56,7 @@ class TorchMultiTokenAttention(torch.nn.Module):
     "dtype, atol, rtol",
     [
         (torch.float32, 1e-4, 1e-4),
+        (torch.float16, 2e-2, 2e-2),
         pytest.param(
             torch.bfloat16,
             2e-2,
@@ -98,10 +103,9 @@ def test_multi_token_attention_correctness(B, C_in, C_out, L, K, groups, bias, d
 
     assert_verbose_allclose(out1, out2, atol=atol, rtol=rtol)
 
-    loss1 = out1.sum()
-    loss2 = out2.sum()
-    loss1.backward()
-    loss2.backward()
+    grad_output = torch.randn_like(out1)
+    out1.backward(gradient=grad_output)
+    out2.backward(gradient=grad_output.clone())
 
     assert_verbose_allclose(scores1.grad, scores2.grad, atol=atol, rtol=rtol)
     assert_verbose_allclose(liger_attn.weight.grad, ref_attn.weight.grad, atol=atol, rtol=rtol)
@@ -115,6 +119,8 @@ def test_multi_token_attention_correctness(B, C_in, C_out, L, K, groups, bias, d
         (2, 4, 4, 8, 3, 1),
         (1, 2, 2, 5, 1, 1),
         (3, 6, 6, 6, 3, 1),
+        (1, 4, 4, 33, 5, 4),
+        (1, 8, 8, 64, 3, 2),
     ],
 )
 @pytest.mark.parametrize("bias", [True, False])
@@ -122,6 +128,7 @@ def test_multi_token_attention_correctness(B, C_in, C_out, L, K, groups, bias, d
     "dtype, atol, rtol",
     [
         (torch.float32, 1e-4, 1e-4),
+        (torch.float16, 2e-2, 2e-2),
         pytest.param(
             torch.bfloat16,
             2e-2,
@@ -166,15 +173,83 @@ def test_multi_token_attention_functional(B, C_in, C_out, L, K, groups, bias, dt
 
     assert_verbose_allclose(out1, out2, atol=atol, rtol=rtol)
 
-    loss1 = out1.sum()
-    loss2 = out2.sum()
-    loss1.backward()
-    loss2.backward()
+    grad_output = torch.randn_like(out1)
+    out1.backward(gradient=grad_output)
+    out2.backward(gradient=grad_output.clone())
 
     assert_verbose_allclose(scores1.grad, scores2.grad, atol=atol, rtol=rtol)
     assert_verbose_allclose(weight1.grad, ref_attn.weight.grad, atol=atol, rtol=rtol)
     if bias:
         assert_verbose_allclose(bias1.grad, ref_attn.bias.grad, atol=atol, rtol=rtol)
+
+
+@pytest.mark.parametrize(
+    "dtype, atol, rtol",
+    [
+        (torch.float32, 1e-4, 1e-4),
+        (torch.float16, 2e-2, 2e-2),
+        pytest.param(
+            torch.bfloat16,
+            2e-2,
+            2e-2,
+            marks=pytest.mark.skipif(
+                not supports_bfloat16(),
+                reason="bfloat16 not supported on this device",
+            ),
+        ),
+    ],
+)
+def test_multi_token_attention_noncontiguous_scores(dtype, atol, rtol):
+    B, C_in, C_out, L, K, groups = 1, 4, 4, 33, 3, 2
+    scores = torch.randn(B, C_in, L, L, device=device, dtype=dtype).transpose(-1, -2)
+    assert not scores.is_contiguous()
+    weight = torch.randn(C_out, C_in // groups, K, K, device=device, dtype=dtype)
+    bias = torch.randn(C_out, device=device, dtype=dtype)
+    grad_output = torch.randn(B, C_out, L, L, device=device, dtype=dtype)
+
+    scores1 = scores.detach().requires_grad_(True)
+    scores2 = scores.detach().requires_grad_(True)
+    weight1 = weight.detach().clone().requires_grad_(True)
+    weight2 = weight.detach().clone().requires_grad_(True)
+    bias1 = bias.detach().clone().requires_grad_(True)
+    bias2 = bias.detach().clone().requires_grad_(True)
+
+    out1 = liger_multi_token_attention(scores1, weight1, bias1, padding=K // 2, groups=groups)
+    mask = _make_mask(L, scores2.device)
+    probs = F.softmax(scores2.masked_fill(~mask, -1e9), dim=-1)
+    out2 = F.conv2d(probs, weight2, bias2, padding=K // 2, groups=groups).masked_fill(~mask, 0.0)
+
+    assert_verbose_allclose(out1, out2, atol=atol, rtol=rtol)
+    out1.backward(gradient=grad_output)
+    out2.backward(gradient=grad_output.clone())
+    assert_verbose_allclose(scores1.grad, scores2.grad, atol=atol, rtol=rtol)
+    assert_verbose_allclose(weight1.grad, weight2.grad, atol=atol, rtol=rtol)
+    assert_verbose_allclose(bias1.grad, bias2.grad, atol=atol, rtol=rtol)
+
+
+def test_multi_token_attention_reuses_softmax_launch_metadata(monkeypatch):
+    metadata = {}
+    original_forward = multi_token_attention_ops._softmax_forward
+    original_backward = multi_token_attention_ops._softmax_backward
+
+    def capture_forward(scores):
+        result = original_forward(scores)
+        metadata["forward"] = result[1:]
+        return result
+
+    def capture_backward(grad_output, output, BLOCK_SIZE, num_warps, multi_block_launch):
+        metadata["backward"] = (BLOCK_SIZE, num_warps, multi_block_launch)
+        return original_backward(grad_output, output, BLOCK_SIZE, num_warps, multi_block_launch)
+
+    monkeypatch.setattr(multi_token_attention_ops, "_softmax_forward", capture_forward)
+    monkeypatch.setattr(multi_token_attention_ops, "_softmax_backward", capture_backward)
+
+    scores = torch.randn(1, 2, 33, 33, device=device, dtype=torch.float32, requires_grad=True)
+    weight = torch.randn(2, 2, 3, 3, device=device, dtype=torch.float32, requires_grad=True)
+    output = liger_multi_token_attention(scores, weight, padding=1)
+    output.backward(torch.randn_like(output))
+
+    assert metadata["backward"] == metadata["forward"]
 
 
 class TorchSparseMultiTokenAttention(TorchMultiTokenAttention):
