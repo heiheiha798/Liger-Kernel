@@ -275,6 +275,14 @@ def test_default_path_supports_repeated_backward():
     assert torch.equal(h.grad, first)
 
 
+@pytest.fixture
+def isolated_fused_gate_up_tiling_cache():
+    swiglu_ops._should_use_fused_sm103_tiling.cache_clear()
+    yield
+    swiglu_ops._should_use_fused_sm103_tiling.cache_clear()
+
+
+@pytest.mark.usefixtures("isolated_fused_gate_up_tiling_cache")
 @pytest.mark.parametrize(
     "arch, ffn_size, dtype, expected, queries_arch",
     [
@@ -298,9 +306,11 @@ def test_fused_gate_up_sm103_tiled_dispatch(monkeypatch, arch, ffn_size, dtype, 
 
     monkeypatch.setattr(swiglu_ops, "infer_device_arch", infer_arch)
     assert swiglu_ops._should_use_fused_sm103_tiling(ffn_size, torch.device("cuda:7"), dtype) is expected
+    assert swiglu_ops._should_use_fused_sm103_tiling(ffn_size, torch.device("cuda:7"), dtype) is expected
     assert requested_device_ids == ([7] if queries_arch else [])
 
 
+@pytest.mark.usefixtures("isolated_fused_gate_up_tiling_cache")
 def test_fused_gate_up_tiling_rejects_non_cuda_without_arch_query(monkeypatch):
     monkeypatch.setattr(
         swiglu_ops,

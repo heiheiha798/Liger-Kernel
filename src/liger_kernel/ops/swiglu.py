@@ -1,3 +1,5 @@
+import functools
+
 import torch
 import triton
 import triton.language as tl
@@ -314,6 +316,7 @@ _FUSED_SWIGLU_SM103_TILE_MAX_WIDTH = 32768
 _FUSED_SWIGLU_SM103_LEGACY_WIDTHS = (11008,)
 
 
+@functools.lru_cache(maxsize=None)
 def _should_use_fused_sm103_tiling(ffn_size, device, dtype):
     if (
         device.type != "cuda"
