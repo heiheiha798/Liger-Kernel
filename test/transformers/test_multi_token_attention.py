@@ -216,7 +216,8 @@ def test_multi_token_attention_noncontiguous_scores(dtype, atol, rtol):
 
     out1 = liger_multi_token_attention(scores1, weight1, bias1, padding=K // 2, groups=groups)
     mask = _make_mask(L, scores2.device)
-    probs = F.softmax(scores2.masked_fill(~mask, -1e9), dim=-1)
+    inf = torch.tensor(-1e9, device=scores2.device, dtype=scores2.dtype)
+    probs = F.softmax(scores2.masked_fill(~mask, inf), dim=-1)
     out2 = F.conv2d(probs, weight2, bias2, padding=K // 2, groups=groups).masked_fill(~mask, 0.0)
 
     assert_verbose_allclose(out1, out2, atol=atol, rtol=rtol)
