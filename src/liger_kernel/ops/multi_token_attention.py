@@ -5,6 +5,7 @@ import triton.language as tl
 
 from torch.nn.modules.utils import _pair
 
+from liger_kernel.ops.softmax import _softmax_backward
 from liger_kernel.ops.softmax import _softmax_forward
 from liger_kernel.ops.sparsemax import _sparsemax_backward
 from liger_kernel.ops.sparsemax import _sparsemax_forward
@@ -197,10 +198,16 @@ class LigerMultiTokenAttentionFunction(torch.autograd.Function):
                 raise RuntimeError("Internal error: Sparse flag is set but sparse tensor was not saved.")
             grad_scores_inf = _sparsemax_backward(grad_probs, out_flat_sparse, dim=dim)
         else:
-            grad_probs_cont = grad_probs
-            probs_cont = activation_output
-            dot = (grad_probs_cont * probs_cont).sum(dim=-1, keepdim=True)
-            grad_scores_inf = probs_cont * (grad_probs_cont - dot)
+            n_cols = activation_output.shape[-1]
+            BLOCK_SIZE, num_warps = calculate_settings(n_cols)
+            multi_block_launch = n_cols > BLOCK_SIZE
+            grad_scores_inf = _softmax_backward(
+                grad_probs,
+                activation_output,
+                BLOCK_SIZE,
+                num_warps,
+                multi_block_launch,
+            )
 
         grad_scores = _mask_inf_backward(grad_scores_inf)
 
