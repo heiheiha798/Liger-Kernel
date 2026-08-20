@@ -139,7 +139,6 @@ class LigerMultiTokenAttentionFunction(torch.autograd.Function):
             activation_output = probs_softmax
             ctx.save_for_backward(scores_inf, activation_output, weight, bias)
             ctx.out_flat_sparse_saved = False
-            ctx.softmax_backward_args = (BLOCK_SIZE, num_warps, multi_block_launch)
 
         out_conv = F.conv2d(
             activation_output,
@@ -158,6 +157,8 @@ class LigerMultiTokenAttentionFunction(torch.autograd.Function):
         ctx.dilation = _pair(dilation)
         ctx.groups = groups
         ctx.dim = -1
+        if not sparse:
+            ctx.softmax_backward_args = (BLOCK_SIZE, num_warps, multi_block_launch)
 
         return out
 
