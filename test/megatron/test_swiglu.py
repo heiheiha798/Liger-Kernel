@@ -15,6 +15,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+import liger_kernel.ops.swiglu as swiglu_ops
+
 from liger_kernel.megatron.swiglu import LigerMegatronSwiGLU
 from liger_kernel.ops.swiglu import LigerFusedGateUpSiLUMulFunction
 from liger_kernel.ops.swiglu import LigerSiLUMulFunction
@@ -271,6 +273,94 @@ def test_default_path_supports_repeated_backward():
     out.backward(do, retain_graph=True)
 
     assert torch.equal(h.grad, first)
+
+
+@pytest.mark.parametrize(
+    "arch, ffn_size, expected",
+    [
+        ("blackwell_ultra", 8192, False),
+        ("blackwell_ultra", 8193, True),
+        ("blackwell_ultra", 32767, True),
+        ("blackwell_ultra", 32768, False),
+        ("blackwell", 14336, False),
+        ("hopper", 14336, False),
+    ],
+)
+def test_fused_gate_up_sm103_tiled_dispatch(monkeypatch, arch, ffn_size, expected):
+    requested_device_ids = []
+
+    def infer_arch(device_id):
+        requested_device_ids.append(device_id)
+        return arch
+
+    monkeypatch.setattr(swiglu_ops, "infer_device_arch", infer_arch)
+    assert swiglu_ops._should_use_fused_sm103_tiling(ffn_size, torch.device("cuda:7")) is expected
+    assert requested_device_ids == [7]
+
+
+def test_fused_gate_up_tiling_rejects_non_cuda_without_arch_query(monkeypatch):
+    monkeypatch.setattr(
+        swiglu_ops,
+        "infer_device_arch",
+        lambda _device_id: pytest.fail("architecture queried for a non-CUDA tensor"),
+    )
+    assert not swiglu_ops._should_use_fused_sm103_tiling(14336, torch.device("cpu"))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="SM103 tiled fused SwiGLU path is CUDA-only")
+@pytest.mark.parametrize(
+    "shape",
+    [
+        (1, 2 * 8192),
+        (1, 2 * 8193),
+        (3, 2 * 14337),
+        (1, 3, 2 * 14336),
+        (1, 1, 2 * 32768),
+    ],
+)
+@pytest.mark.parametrize("in_place", [False, True])
+@pytest.mark.parametrize(
+    "dtype, atol, rtol",
+    [
+        (torch.float16, 1e-2, 1e-2),
+        pytest.param(
+            torch.bfloat16,
+            1e-2,
+            1e-2,
+            marks=pytest.mark.skipif(not supports_bfloat16(), reason="bfloat16 not supported on this GPU"),
+        ),
+        (torch.float32, 1e-5, 1e-5),
+    ],
+)
+def test_fused_gate_up_tiled_matches_one_row_and_reference(monkeypatch, shape, in_place, dtype, atol, rtol):
+    torch.manual_seed(0)
+    source = torch.randn(shape, device=device, dtype=dtype)
+    dc = torch.randn(*shape[:-1], shape[-1] // 2, device=device, dtype=dtype)
+
+    reference_input = source.clone().requires_grad_(True)
+    reference_output = _megatron_swiglu_reference(reference_input)
+    reference_output.backward(dc)
+
+    def run(use_tiled):
+        monkeypatch.setattr(swiglu_ops, "_should_use_fused_sm103_tiling", lambda _ffn, _device: use_tiled)
+        kernel_input = source.clone().requires_grad_(True)
+        output = LigerFusedGateUpSiLUMulFunction.apply(kernel_input, in_place)
+        output.backward(dc)
+        input_after = kernel_input.detach().clone()
+        gradient = kernel_input.grad.detach().clone()
+        if in_place:
+            assert torch.equal(input_after, gradient)
+        else:
+            assert torch.equal(input_after, source)
+        return output.detach(), gradient
+
+    one_row_output, one_row_gradient = run(False)
+    tiled_output, tiled_gradient = run(True)
+
+    torch.testing.assert_close(tiled_output, one_row_output, rtol=0, atol=0)
+    torch.testing.assert_close(tiled_gradient, one_row_gradient, rtol=0, atol=0)
+    assert_verbose_allclose(tiled_output, reference_output, atol=atol, rtol=rtol)
+    assert_verbose_allclose(tiled_gradient, reference_input.grad, atol=atol, rtol=rtol)
 
 
 # ---------------------------------------------------------------------------
