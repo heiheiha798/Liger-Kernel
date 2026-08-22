@@ -15,6 +15,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+import liger_kernel.ops.swiglu as swiglu_ops
+
 from liger_kernel.megatron.swiglu import LigerMegatronSwiGLU
 from liger_kernel.ops.swiglu import LigerFusedGateUpSiLUMulFunction
 from liger_kernel.ops.swiglu import LigerSiLUMulFunction
@@ -271,6 +273,134 @@ def test_default_path_supports_repeated_backward():
     out.backward(do, retain_graph=True)
 
     assert torch.equal(h.grad, first)
+
+
+@pytest.fixture
+def isolated_fused_gate_up_tiling_cache():
+    swiglu_ops._should_use_fused_sm103_tiling.cache_clear()
+    yield
+    swiglu_ops._should_use_fused_sm103_tiling.cache_clear()
+
+
+@pytest.mark.usefixtures("isolated_fused_gate_up_tiling_cache")
+@pytest.mark.parametrize(
+    "arch, ffn_size, dtype, expected, queries_arch",
+    [
+        ("blackwell_ultra", 8192, torch.bfloat16, False, False),
+        ("blackwell_ultra", 8193, torch.bfloat16, True, True),
+        ("blackwell_ultra", 11008, torch.float16, False, False),
+        ("blackwell_ultra", 14336, torch.float16, True, True),
+        ("blackwell_ultra", 14336, torch.float32, False, False),
+        ("blackwell_ultra", 32767, torch.bfloat16, True, True),
+        ("blackwell_ultra", 32768, torch.bfloat16, False, False),
+        ("blackwell", 14336, torch.bfloat16, False, True),
+        ("hopper", 14336, torch.bfloat16, False, True),
+    ],
+)
+def test_fused_gate_up_sm103_tiled_dispatch(monkeypatch, arch, ffn_size, dtype, expected, queries_arch):
+    requested_device_ids = []
+
+    def infer_arch(device_id):
+        requested_device_ids.append(device_id)
+        return arch
+
+    monkeypatch.setattr(swiglu_ops, "infer_device_arch", infer_arch)
+    assert swiglu_ops._should_use_fused_sm103_tiling(ffn_size, torch.device("cuda:7"), dtype) is expected
+    assert swiglu_ops._should_use_fused_sm103_tiling(ffn_size, torch.device("cuda:7"), dtype) is expected
+    assert requested_device_ids == ([7] if queries_arch else [])
+
+
+@pytest.mark.usefixtures("isolated_fused_gate_up_tiling_cache")
+def test_fused_gate_up_tiling_rejects_non_cuda_without_arch_query(monkeypatch):
+    monkeypatch.setattr(
+        swiglu_ops,
+        "infer_device_arch",
+        lambda _device_id: pytest.fail("architecture queried for a non-CUDA tensor"),
+    )
+    assert not swiglu_ops._should_use_fused_sm103_tiling(14336, torch.device("cpu"), torch.bfloat16)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="SM103 tiled fused SwiGLU path is CUDA-only")
+def test_fused_gate_up_tiled_launch_uses_input_device_context(monkeypatch):
+    entered_devices = []
+    original_device_context = swiglu_ops.device_context
+
+    def recording_device_context(input_device):
+        entered_devices.append(input_device)
+        return original_device_context(input_device)
+
+    monkeypatch.setattr(
+        swiglu_ops,
+        "_should_use_fused_sm103_tiling",
+        lambda _ffn, _device, _dtype: True,
+    )
+    monkeypatch.setattr(swiglu_ops, "device_context", recording_device_context)
+
+    kernel_input = torch.randn((3, 2 * 8193), device=device, dtype=torch.float16, requires_grad=True)
+    output = LigerMegatronSwiGLU()(kernel_input)
+    output.backward(torch.randn_like(output))
+
+    assert entered_devices == [kernel_input.device, kernel_input.device]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="SM103 tiled fused SwiGLU path is CUDA-only")
+@pytest.mark.parametrize(
+    "shape",
+    [
+        (1, 2 * 8192),
+        (1, 2 * 8193),
+        (3, 2 * 14337),
+        (1, 3, 2 * 14336),
+        (1, 1, 2 * 32768),
+    ],
+)
+@pytest.mark.parametrize("in_place", [False, True])
+@pytest.mark.parametrize(
+    "dtype, atol, rtol",
+    [
+        (torch.float16, 1e-2, 1e-2),
+        pytest.param(
+            torch.bfloat16,
+            1e-2,
+            1e-2,
+            marks=pytest.mark.skipif(not supports_bfloat16(), reason="bfloat16 not supported on this GPU"),
+        ),
+        (torch.float32, 1e-5, 1e-5),
+    ],
+)
+def test_fused_gate_up_tiled_matches_one_row_and_reference(monkeypatch, shape, in_place, dtype, atol, rtol):
+    torch.manual_seed(0)
+    source = torch.randn(shape, device=device, dtype=dtype)
+    dc = torch.randn(*shape[:-1], shape[-1] // 2, device=device, dtype=dtype)
+
+    reference_input = source.clone().requires_grad_(True)
+    reference_output = _megatron_swiglu_reference(reference_input)
+    reference_output.backward(dc)
+
+    def run(use_tiled):
+        monkeypatch.setattr(
+            swiglu_ops,
+            "_should_use_fused_sm103_tiling",
+            lambda _ffn, _device, _dtype: use_tiled,
+        )
+        kernel_input = source.clone().requires_grad_(True)
+        output = LigerMegatronSwiGLU(in_place=in_place)(kernel_input)
+        output.backward(dc)
+        input_after = kernel_input.detach().clone()
+        gradient = kernel_input.grad.detach().clone()
+        if in_place:
+            assert torch.equal(input_after, gradient)
+        else:
+            assert torch.equal(input_after, source)
+        return output.detach(), gradient
+
+    one_row_output, one_row_gradient = run(False)
+    tiled_output, tiled_gradient = run(True)
+
+    torch.testing.assert_close(tiled_output, one_row_output, rtol=0, atol=0)
+    torch.testing.assert_close(tiled_gradient, one_row_gradient, rtol=0, atol=0)
+    assert_verbose_allclose(tiled_output, reference_output, atol=atol, rtol=rtol)
+    assert_verbose_allclose(tiled_gradient, reference_input.grad, atol=atol, rtol=rtol)
 
 
 # ---------------------------------------------------------------------------

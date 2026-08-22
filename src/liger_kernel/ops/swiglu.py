@@ -1,3 +1,5 @@
+import functools
+
 import torch
 import triton
 import triton.language as tl
@@ -303,6 +305,30 @@ class LigerSiLUMulFunction(torch.autograd.Function):
 # the kernels read both halves via a column offset into the single buffer -- no copies,
 # no cat. Input row stride is ``2 * ffn_size``, output is ``ffn_size``.
 
+# On SM103, the one-row backward kernel becomes register-limited once its
+# next-power-of-two block reaches 16384 columns. Fixed column tiles reduce the
+# live vector width while preserving the elementwise arithmetic. FP32 and the
+# 11008/32768 widths stay on the one-row path because they regressed in the
+# B300 sweep.
+_FUSED_SWIGLU_SM103_TILE_SIZE = 1024
+_FUSED_SWIGLU_SM103_TILE_MIN_BLOCK = 16384
+_FUSED_SWIGLU_SM103_TILE_MAX_WIDTH = 32768
+_FUSED_SWIGLU_SM103_LEGACY_WIDTHS = (11008,)
+
+
+@functools.lru_cache(maxsize=None)
+def _should_use_fused_sm103_tiling(ffn_size, device, dtype):
+    if (
+        device.type != "cuda"
+        or dtype not in (torch.bfloat16, torch.float16)
+        or triton.next_power_of_2(ffn_size) < _FUSED_SWIGLU_SM103_TILE_MIN_BLOCK
+        or ffn_size >= _FUSED_SWIGLU_SM103_TILE_MAX_WIDTH
+        or ffn_size in _FUSED_SWIGLU_SM103_LEGACY_WIDTHS
+    ):
+        return False
+    device_id = device.index if device.index is not None else torch.cuda.current_device()
+    return infer_device_arch(device_id) == "blackwell_ultra"
+
 
 @triton.jit
 def _swiglu_fused_gate_up_forward_kernel(
@@ -351,6 +377,51 @@ def _swiglu_fused_gate_up_backward_kernel(
     tl.store(dy_ptr + ffn_size + col_offsets, d_up, mask=mask)
 
 
+@triton.jit
+def _swiglu_fused_gate_up_forward_kernel_tiled(
+    y_ptr, c_ptr, in_stride, out_stride, ffn_size: tl.constexpr, BLOCK_SIZE: tl.constexpr
+):
+    row = tl.program_id(0).to(tl.int64)
+    col_tile = tl.program_id(1)
+
+    y_ptr += row * in_stride
+    c_ptr += row * out_stride
+
+    col_offsets = col_tile * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = col_offsets < ffn_size
+
+    gate = tl.load(y_ptr + col_offsets, mask=mask, other=0).to(tl.float32)
+    up = tl.load(y_ptr + ffn_size + col_offsets, mask=mask, other=0)
+    tl.store(c_ptr + col_offsets, silu(gate).cast(up.dtype) * up, mask=mask)
+
+
+@triton.jit
+def _swiglu_fused_gate_up_backward_kernel_tiled(
+    dc_ptr, y_ptr, dy_ptr, in_stride, out_stride, ffn_size: tl.constexpr, BLOCK_SIZE: tl.constexpr
+):
+    row = tl.program_id(0).to(tl.int64)
+    col_tile = tl.program_id(1)
+
+    dc_ptr += row * out_stride
+    y_ptr += row * in_stride
+    dy_ptr += row * in_stride
+
+    col_offsets = col_tile * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = col_offsets < ffn_size
+
+    dc = tl.load(dc_ptr + col_offsets, mask=mask, other=0)
+    gate = tl.load(y_ptr + col_offsets, mask=mask, other=0).to(tl.float32)
+    up = tl.load(y_ptr + ffn_size + col_offsets, mask=mask, other=0)
+
+    sig = tl.sigmoid(gate)
+    silu_gate = gate * sig
+    d_gate = dc * (silu_gate * (1 - sig) + sig) * up
+    d_up = dc * silu_gate
+
+    tl.store(dy_ptr + col_offsets, d_gate, mask=mask)
+    tl.store(dy_ptr + ffn_size + col_offsets, d_up, mask=mask)
+
+
 def swiglu_fused_gate_up_forward(y):
     """SwiGLU over a fused ``[..., 2 * ffn_size]`` gate-up tensor. Returns ``(y, c)``."""
     ori_shape = y.shape
@@ -362,6 +433,21 @@ def swiglu_fused_gate_up_forward(y):
     y = y.view(-1, fused_size)
     n_rows = y.shape[0]
     c = torch.empty(n_rows, ffn_size, dtype=y.dtype, device=y.device)
+
+    if _should_use_fused_sm103_tiling(ffn_size, y.device, y.dtype):
+        block_size = _FUSED_SWIGLU_SM103_TILE_SIZE
+        grid = (n_rows, triton.cdiv(ffn_size, block_size))
+        with device_context(y.device):
+            _swiglu_fused_gate_up_forward_kernel_tiled[grid](
+                y,
+                c,
+                y.stride(-2),
+                c.stride(-2),
+                ffn_size=ffn_size,
+                BLOCK_SIZE=block_size,
+                num_warps=4,
+            )
+        return y, c.view(*ori_shape[:-1], ffn_size)
 
     BLOCK_SIZE, num_warps = calculate_settings(ffn_size)
     _swiglu_fused_gate_up_forward_kernel[(n_rows,)](
@@ -392,6 +478,22 @@ def swiglu_fused_gate_up_backward(y, dc, in_place=False):
     dc = dc.view(-1, ffn_size)
     n_rows = dc.shape[0]
     dy = y if in_place else torch.empty_like(y)
+
+    if _should_use_fused_sm103_tiling(ffn_size, y.device, y.dtype):
+        block_size = _FUSED_SWIGLU_SM103_TILE_SIZE
+        grid = (n_rows, triton.cdiv(ffn_size, block_size))
+        with device_context(y.device):
+            _swiglu_fused_gate_up_backward_kernel_tiled[grid](
+                dc,
+                y,
+                dy,
+                y.stride(-2),
+                dc.stride(-2),
+                ffn_size=ffn_size,
+                BLOCK_SIZE=block_size,
+                num_warps=4,
+            )
+        return dy
 
     BLOCK_SIZE, num_warps = calculate_settings(ffn_size)
     _swiglu_fused_gate_up_backward_kernel[(n_rows,)](
